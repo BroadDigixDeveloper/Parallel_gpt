@@ -307,35 +307,62 @@ def worker():
     global worker_running
     worker_running = True
     
-    logger.info("Background worker thread started")
+    logger.info("Background worker thread started with thread ID: %s", threading.get_ident())
     
     while worker_running:
         try:
             # Get up to MAX_CONCURRENT_REQUESTS jobs from the queue
-            queue_size = request_queue.qsize()
-            if queue_size > 0:
-                logger.info(f"Worker found {queue_size} jobs in queue")
-            
-            active_threads = []
-            for _ in range(min(MAX_CONCURRENT_REQUESTS, queue_size)):
+            batch = []
+            for _ in range(MAX_CONCURRENT_REQUESTS):
                 try:
-                    job_id = request_queue.get(block=False)
-                    logger.info(f"Starting new thread for job {job_id}")
-                    # Start a thread for each job
-                    thread = threading.Thread(target=process_job, args=(job_id,), name=f"Job-{job_id}")
-                    thread.start()
-                    active_threads.append(thread)
+                    job_id = request_queue.get(block=True, timeout=1)  # Use blocking with timeout
+                    if job_id in processing_jobs:
+                        batch.append(job_id)
+                        logger.info(f"Added job {job_id} to current processing batch")
                     request_queue.task_done()
                 except queue.Empty:
                     break  # No more jobs in queue
             
-            # Wait for all threads to complete
-            for thread in active_threads:
-                thread.join()
-                logger.info(f"Thread for {thread.name} completed")
+            if batch:
+                logger.info(f"Worker found {len(batch)} jobs to process: {batch}")
+            
+            # Process the batch with ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {
+                    executor.submit(process_job, job_id): job_id for job_id in batch
+                }
                 
-            # Sleep briefly if no jobs were found
-            if not active_threads:
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as e:
+                        job_id = futures[future]
+                        logger.error(f"Error in thread for job {job_id}: {str(e)}", exc_info=True)
+                        # Handle error case
+                        if job_id in processing_jobs:
+                            # Create error JSON and save to file
+                            result = {
+                                "job_id": job_id,
+                                "status": "error",
+                                "submitted_at": processing_jobs[job_id]["submitted_at"],
+                                "completed_at": time.time(),
+                                "error": str(e)
+                            }
+                            
+                            # Save to file
+                            result_path = RESULTS_DIR / f"{job_id}.json"
+                            with open(result_path, 'w') as f:
+                                json.dump(result, f, indent=2)
+                            
+                            # Remove from processing queue
+                            del processing_jobs[job_id]
+            
+            # Log queue status every 30 seconds
+            if time.time() % 30 < 1:
+                logger.info(f"Queue status: Size={request_queue.qsize()}, Active jobs={len(processing_jobs)}")
+                
+            # Sleep a tiny bit if no jobs
+            if not batch:
                 time.sleep(0.1)
                 
         except Exception as e:
@@ -644,11 +671,21 @@ if __name__ == '__main__':
     logger.info(f"Max retries: {MAX_RETRIES}")
     logger.info(f"Results directory: {RESULTS_DIR}")
     
+    # Ensure results directory exists
+    RESULTS_DIR.mkdir(exist_ok=True)
+    
     # Start the worker thread
     logger.info("Starting background worker thread")
     worker_thread = threading.Thread(target=worker, daemon=True, name="WorkerThread")
     worker_thread.start()
     
     # Run the app
-    port = int(os.getenv('PORT', 8081))
+    port = int(os.environ.get('PORT', 8081))
+    logger.info(f"Starting Flask web server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+else:
+    # For when imported as a module (like with Gunicorn)
+    RESULTS_DIR.mkdir(exist_ok=True)
+    logger.info("Starting background worker thread (WSGI mode)")
+    worker_thread = threading.Thread(target=worker, daemon=True, name="WorkerThread")
+    worker_thread.start()
