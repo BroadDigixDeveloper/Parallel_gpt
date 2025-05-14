@@ -650,5 +650,5 @@ if __name__ == '__main__':
     worker_thread.start()
     
     # Run the app
-    logger.info("Starting Flask web server on port 8081")
-    app.run(host='0.0.0.0', port=8081, debug=False)
+    port = int(os.getenv('PORT', 8081))
+    app.run(host='0.0.0.0', port=port, debug=False)
