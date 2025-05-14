@@ -14,11 +14,11 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Configure logging system
+# Configure logging system (unchanged)
 def setup_logging():
     # Create logs directory if it doesn't exist
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
+    # # log_dir = Path("logs")
+    # log_dir.mkdir(exist_ok=True)
     
     # Configure root logger
     logger = logging.getLogger()
@@ -31,18 +31,18 @@ def setup_logging():
     console_handler.setFormatter(console_formatter)
     
     # File handler with rotation (10MB max size, keep 5 backup files)
-    file_handler = RotatingFileHandler(
-        log_dir / "gpt_processor.log", 
-        maxBytes=10*1024*1024,  # 10MB
-        backupCount=5
-    )
-    file_handler.setLevel(logging.INFO)
-    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
-    file_handler.setFormatter(file_formatter)
+    # file_handler = RotatingFileHandler(
+    #     log_dir / "gpt_processor.log", 
+    #     maxBytes=10*1024*1024,  # 10MB
+    #     backupCount=5
+    # )
+    # file_handler.setLevel(logging.INFO)
+    # file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
+    # file_handler.setFormatter(file_formatter)
     
     # Add handlers
     logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
+    # logger.addHandler(file_handler)
     
     return logger
 
@@ -51,10 +51,15 @@ logger = setup_logging()
 
 app = Flask(__name__)
 
-# Configuration
+# Updated Configuration
 API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-MODEL = "gpt-4o"
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"  # Updated to responses endpoint
+DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MAX_TOKENS = 2000
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TOP_P = 0.9
+DEFAULT_FREQUENCY_PENALTY = 0.0
+DEFAULT_PRESENCE_PENALTY = 0.1
 MAX_CONCURRENT_REQUESTS = 10
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0
@@ -69,124 +74,41 @@ processing_jobs = {}  # Jobs being processed
 request_queue = queue.Queue()
 worker_running = False
 
-def prepare_gpt_request(json_data):
-    """Prepare the GPT request from the JSON data"""
+def prepare_gpt_request(json_data, request_params):
+    """Prepare the GPT request from the user-provided JSON data and request parameters"""
     start_time = time.time()
-    logger.info(f"Preparing GPT request for URL: {json_data.get('url', 'Unknown URL')}")
+    logger.info(f"Preparing GPT request with user-provided prompts")
     
     try:
-        # Default system message as per client example
-        system_message = {
-            "role": "system",
-            "content": (
-                "Format for a light editing environment with no bolding, indenting, or markdown. "
-                "Use only standard text characters.\n\n"
-                "Target User: The target user is the leader who is leading this change initiative.\n\n"
-                "The goal is for them to feel, think, and do the following:\n\n"
-                "Feel - I want them to feel clear and supported in completing the instructions.\n\n"
-                "Think - I want them to think that completing these instructions is crucial to the success of the initiative.\n\n"
-                "Do - I want them to promptly complete this action according to the instructions provided, ensuring accuracy and attention to detail."
-            )
-        }
-
-        # Extract the website data from the scrapped JSON
-        website_data = json_data.get("result", {})
+        # Extract system and user prompts directly from the JSON
+        system_content = json_data.get("system", "You are a helpful assistant.")
+        user_content = json_data.get("user", "")
         
-        # Extract key information
-        site_title = website_data.get("page_info", {}).get("title", "Unknown Site")
-        site_url = json_data.get("url", "Unknown URL")
-        logger.info(f"Processing website: {site_title} - {site_url}")
+        if not user_content:
+            logger.error("No user prompt provided in the JSON data")
+            return None
         
-        # Extract main content
-        paragraphs = website_data.get("main_content", {}).get("paragraphs", [])
-        headings = website_data.get("main_content", {}).get("headings", {})
-        h1s = headings.get("h1", [])
-        h2s = headings.get("h2", [])
+        # Create messages array
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content}
+        ]
         
-        # Log content statistics
-        logger.info(f"Content stats - Paragraphs: {len(paragraphs)}, H1s: {len(h1s)}, H2s: {len(h2s)}")
-        
-        # Extract navigation links
-        navigation = website_data.get("header", {}).get("navigation", [])
-        nav_items = [f"{item.get('text', '')}: {item.get('url', '')}" for item in navigation if item.get('text')]
-        
-        # Extract forms
-        forms = website_data.get("forms", [])
-        form_fields = []
-        for form in forms:
-            for field in form.get("fields", []):
-                field_info = f"{field.get('type', 'field')}: {field.get('name', '')} - {field.get('placeholder', '')}"
-                form_fields.append(field_info)
-        
-        logger.info(f"Additional content - Navigation items: {len(nav_items)}, Forms: {len(forms)}, Form fields: {len(form_fields)}")
-        
-        # Construct content to analyze
-        content_sections = []
-        
-        if h1s:
-            content_sections.append("# Main Headings:\n" + "\n".join(h1s))
-        
-        if h2s:
-            content_sections.append("# Sub Headings:\n" + "\n".join(h2s))
-        
-        if paragraphs:
-            content_sections.append("# Main Content:\n" + "\n".join(paragraphs))  
-        
-        if nav_items:
-            content_sections.append("# Navigation Links:\n" + "\n".join(nav_items))
-        
-        if form_fields:
-            content_sections.append("# Form Fields:\n" + "\n".join(form_fields))  # All form fields
-        
-        content_text = "\n\n".join(content_sections)
-        # Log content text size
-        content_size = len(content_text)
-        logger.info(f"Prepared content text size: {content_size} characters")
-        
-        # Create user message with the content to be analyzed using client's preferred format
-        user_message = {
-            "role": "user",
-            "content": (
-                f"[Style]\nUnspecified\n\n"
-                f"[Writing Perspective]\n"
-                f"Third-person Objective: Ensure the responses are neutral and objective, avoiding personal interpretations or perspectives. "
-                f"Maintain a professional tone suitable for formal documentation.\n\n"
-                f"[Output Format]\nDefault: Unspecified\n\n"
-                f"[Actions]\n"
-                f"Here is a list of actions for ChatGPT to perform:\n\n"
-                f"Objective:\nGenerate a detailed analysis of the website.\n\n"
-                f"Instructions:\n\n"
-                f"1. Present the header as follows:\nWebsite Analysis Summary for {site_title}\n\n"
-                f"2. Analyze the website at {site_url} based on the scraped content.\n\n"
-                f"3. Address these topics:\n"
-                f"- Primary Purpose of the Website\n"
-                f"- Target Audience\n"
-                f"- Key Products or Services\n"
-                f"- Content Organization\n"
-                f"- Main Value Propositions\n"
-                f"- Call to Actions\n"
-                f"- Overall User Experience\n\n"
-                f"4. Proceed topic by topic. For each include 2 to 5 paragraphs with key insights.\n\n"
-                f"5. Based on the scraped content provided below:\n\n"
-                f"{content_text}"
-            )
-        }
-        
-        # Create the full request payload
+        # Create the full request payload with parameters from request or defaults
         request_data = {
-            "model": MODEL,
-            "messages": [system_message, user_message],
-            "temperature": 0.2,
-            "max_tokens": 2000,
-            "top_p": 0.9,
-            "frequency_penalty": 0.0,
-            "presence_penalty": 0.1,
+            "model": request_params.get("model", DEFAULT_MODEL),
+            "messages": messages,
+            "temperature": float(request_params.get("temperature", DEFAULT_TEMPERATURE)),
+            "max_tokens": int(request_params.get("max_tokens", DEFAULT_MAX_TOKENS)),
+            "top_p": float(request_params.get("top_p", DEFAULT_TOP_P)),
+            "frequency_penalty": float(request_params.get("frequency_penalty", DEFAULT_FREQUENCY_PENALTY)),
+            "presence_penalty": float(request_params.get("presence_penalty", DEFAULT_PRESENCE_PENALTY)),
             "response_format": {"type": "text"}
         }
         
-        # Log request size
-        request_size = len(json.dumps(request_data))
-        logger.info(f"GPT request prepared successfully. Size: {request_size} bytes. Time taken: {time.time() - start_time:.2f}s")
+        # Log request details
+        logger.info(f"GPT request prepared successfully with model: {request_data['model']}, max_tokens: {request_data['max_tokens']}")
+        logger.info(f"Request preparation time: {time.time() - start_time:.2f}s")
         
         return request_data
     
@@ -207,7 +129,7 @@ def call_openai_with_retry(request_data, job_id, max_retries=MAX_RETRIES, initia
                 time.sleep(backoff)
                 
             response = requests.post(
-                OPENAI_API_URL,
+                OPENAI_API_URL,  # Using the updated responses endpoint
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {API_KEY}"
@@ -262,8 +184,7 @@ def process_job(job_id):
             
         job = processing_jobs[job_id]
         job["status"] = "processing"
-        url = job.get("json_data", {}).get("url", "Unknown URL")
-        logger.info(f"Processing job {job_id} for URL: {url}")
+        logger.info(f"Processing job {job_id}")
         
         # Log request time
         api_start_time = time.time()
@@ -295,7 +216,7 @@ def process_job(job_id):
                     "processing_time": time.time() - job["submitted_at"],
                     "api_time": api_time,
                     "token_usage": token_usage,
-                    "analysis": content
+                    "response": content  # Changed from "analysis" to "response"
                 }
                 
                 # Save to file
@@ -423,7 +344,7 @@ def worker():
 
 @app.route('/api/submit', methods=['POST'])
 def submit_job():
-    """Submit a new job with a JSON file"""
+    """Submit a new job with prompts from text files or JSON"""
     start_time = time.time()
     
     try:
@@ -437,29 +358,65 @@ def submit_job():
         client_ip = request.remote_addr
         logger.info(f"New job submission from {client_ip}. Job ID: {job_id}")
         
-        # Check request size
-        content_length = request.content_length
-        logger.info(f"Job {job_id} request size: {content_length} bytes")
+        # Extract API parameters from request
+        request_params = {
+            "model": request.args.get('model', DEFAULT_MODEL),
+            "max_tokens": request.args.get('max_tokens', DEFAULT_MAX_TOKENS),
+            "temperature": request.args.get('temperature', DEFAULT_TEMPERATURE),
+            "top_p": request.args.get('top_p', DEFAULT_TOP_P),
+            "frequency_penalty": request.args.get('frequency_penalty', DEFAULT_FREQUENCY_PENALTY),
+            "presence_penalty": request.args.get('presence_penalty', DEFAULT_PRESENCE_PENALTY)
+        }
+        
+        logger.info(f"Request parameters for job {job_id}: model={request_params['model']}, max_tokens={request_params['max_tokens']}, "
+                   f"temperature={request_params['temperature']}, top_p={request_params['top_p']}")
         
         # Check if job already exists
         if job_id in processing_jobs or (RESULTS_DIR / f"{job_id}.json").exists():
             logger.warning(f"Job ID '{job_id}' already exists. Request rejected.")
             return jsonify({"error": f"Job ID '{job_id}' already exists"}), 400
         
-        # Get JSON data from request
-        if not request.is_json:
-            logger.warning(f"Job {job_id} rejected: Request must contain JSON data")
-            return jsonify({"error": "Request must contain JSON data"}), 400
+        # Determine request type and get prompt data
+        json_data = {}
         
-        json_data = request.json
-        logger.info(f"Job {job_id} data received for URL: {json_data.get('url', 'Unknown URL')}")
+        # Check if files were uploaded
+        if 'system_file' in request.files and 'user_file' in request.files:
+            system_file = request.files['system_file']
+            user_file = request.files['user_file']
+            
+            try:
+                system_content = system_file.read().decode('utf-8')
+                user_content = user_file.read().decode('utf-8')
+                
+                logger.info(f"Job {job_id} data received from text files")
+                
+                json_data = {
+                    "system": system_content,
+                    "user": user_content
+                }
+            except Exception as e:
+                logger.error(f"Error reading prompt files for job {job_id}: {str(e)}", exc_info=True)
+                return jsonify({"error": f"Error reading prompt files: {str(e)}"}), 400
+                
+        # If no files, try JSON
+        elif request.is_json:
+            json_data = request.json
+            logger.info(f"Job {job_id} data received with system and user prompts from JSON")
+            
+            # Validate that we have at least a user prompt
+            if "user" not in json_data:
+                logger.warning(f"Job {job_id} rejected: JSON must contain a 'user' field with prompt")
+                return jsonify({"error": "JSON must contain a 'user' field with prompt"}), 400
+        else:
+            logger.warning(f"Job {job_id} rejected: Request must contain either prompt files or JSON data")
+            return jsonify({"error": "Request must contain either prompt files or JSON data"}), 400
         
         # Prepare GPT request
         logger.info(f"Preparing GPT request for job {job_id}")
-        gpt_request = prepare_gpt_request(json_data)
+        gpt_request = prepare_gpt_request(json_data, request_params)
         if not gpt_request:
             logger.error(f"Failed to prepare GPT request for job {job_id}")
-            return jsonify({"error": "Failed to prepare GPT request from JSON data"}), 400
+            return jsonify({"error": "Failed to prepare GPT request from the provided data"}), 400
         
         # Create job
         processing_jobs[job_id] = {
@@ -485,6 +442,7 @@ def submit_job():
     except Exception as e:
         logger.error(f"Error submitting job: {str(e)}", exc_info=True)
         return jsonify({"error": f"Error submitting job: {str(e)}"}), 500
+
 
 @app.route('/api/status', methods=['GET'])
 def get_job_status():
@@ -669,7 +627,7 @@ def health_check():
         "queue_size": queue_size,
         "active_jobs": active_jobs,
         "worker_running": worker_running,
-        "model": MODEL,
+        "model": DEFAULT_MODEL,
         "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
         "max_retries": MAX_RETRIES,
         "min_complete_size_kb": MIN_COMPLETE_SIZE_KB
@@ -680,8 +638,8 @@ def health_check():
 
 if __name__ == '__main__':
     # Setup logging
-    logger.info("Starting GPT Website Analysis Service")
-    logger.info(f"Using model: {MODEL}")
+    logger.info("Starting GPT Prompting Service")
+    logger.info(f"Default model: {DEFAULT_MODEL}")
     logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
     logger.info(f"Max retries: {MAX_RETRIES}")
     logger.info(f"Results directory: {RESULTS_DIR}")
