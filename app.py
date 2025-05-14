@@ -373,7 +373,7 @@ def worker():
 
 @app.route('/api/submit', methods=['POST'])
 def submit_job():
-    """Submit a new job with prompts from text files or JSON"""
+    """Submit a new job with prompts from a JSON file or JSON data"""
     start_time = time.time()
     
     try:
@@ -408,44 +408,78 @@ def submit_job():
         # Determine request type and get prompt data
         json_data = {}
         
-        # Check if files were uploaded
-        if 'system_file' in request.files and 'user_file' in request.files:
-            system_file = request.files['system_file']
-            user_file = request.files['user_file']
+        # Check if a JSON file was uploaded
+        if 'json_file' in request.files:
+            json_file = request.files['json_file']
             
             try:
-                system_content = system_file.read().decode('utf-8')
-                user_content = user_file.read().decode('utf-8')
+                json_content = json_file.read().decode('utf-8')
+                json_data = json.loads(json_content)
                 
-                logger.info(f"Job {job_id} data received from text files")
-                
-                json_data = {
-                    "system": system_content,
-                    "user": user_content
-                }
+                logger.info(f"Job {job_id} data received from JSON file")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing JSON file for job {job_id}: {str(e)}", exc_info=True)
+                return jsonify({"error": f"Error parsing JSON file: {str(e)}"}), 400
             except Exception as e:
-                logger.error(f"Error reading prompt files for job {job_id}: {str(e)}", exc_info=True)
-                return jsonify({"error": f"Error reading prompt files: {str(e)}"}), 400
-                
-        # If no files, try JSON
+                logger.error(f"Error reading JSON file for job {job_id}: {str(e)}", exc_info=True)
+                return jsonify({"error": f"Error reading JSON file: {str(e)}"}), 400
+        
+        # If no JSON file, try JSON in request body
         elif request.is_json:
             json_data = request.json
-            logger.info(f"Job {job_id} data received with system and user prompts from JSON")
-            
-            # Validate that we have at least a user prompt
-            if "user" not in json_data:
-                logger.warning(f"Job {job_id} rejected: JSON must contain a 'user' field with prompt")
-                return jsonify({"error": "JSON must contain a 'user' field with prompt"}), 400
+            logger.info(f"Job {job_id} data received with prompts from JSON body")
         else:
-            logger.warning(f"Job {job_id} rejected: Request must contain either prompt files or JSON data")
-            return jsonify({"error": "Request must contain either prompt files or JSON data"}), 400
+            logger.warning(f"Job {job_id} rejected: Request must contain either a JSON file or JSON data in request body")
+            return jsonify({"error": "Request must contain either a JSON file or JSON data in request body"}), 400
+        
+        # Validate that we have required fields
+        if "messages" not in json_data and "user" not in json_data:
+            logger.warning(f"Job {job_id} rejected: JSON must contain either 'messages' array or 'user' field")
+            return jsonify({"error": "JSON must contain either 'messages' array or 'user' field"}), 400
+        
+        # If no messages array but has user field, create messages array
+        if "messages" not in json_data and "user" in json_data:
+            system_content = json_data.get("system", "You are a helpful assistant.")
+            user_content = json_data["user"]
+            
+            # Create messages array in expected format
+            json_data["messages"] = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content}
+            ]
+            
+            logger.info(f"Created messages array from system/user fields for job {job_id}")
         
         # Prepare GPT request
         logger.info(f"Preparing GPT request for job {job_id}")
-        gpt_request = prepare_gpt_request(json_data, request_params)
-        if not gpt_request:
-            logger.error(f"Failed to prepare GPT request for job {job_id}")
-            return jsonify({"error": "Failed to prepare GPT request from the provided data"}), 400
+        
+        # Modified prepare_gpt_request logic included inline
+        try:
+            # Use the messages array directly if it exists
+            if "messages" in json_data:
+                messages = json_data["messages"]
+            else:
+                # This should never happen due to validation above, but just in case
+                logger.error(f"No messages array or user prompt for job {job_id}")
+                return jsonify({"error": "Invalid JSON structure: no messages or user prompt"}), 400
+            
+            # Create the full request payload with parameters from request or defaults
+            gpt_request = {
+                "model": request_params.get("model", DEFAULT_MODEL),
+                "messages": messages,
+                "temperature": float(request_params.get("temperature", DEFAULT_TEMPERATURE)),
+                "max_tokens": int(request_params.get("max_tokens", DEFAULT_MAX_TOKENS)),
+                "top_p": float(request_params.get("top_p", DEFAULT_TOP_P)),
+                "frequency_penalty": float(request_params.get("frequency_penalty", DEFAULT_FREQUENCY_PENALTY)),
+                "presence_penalty": float(request_params.get("presence_penalty", DEFAULT_PRESENCE_PENALTY)),
+                "response_format": {"type": "text"}
+            }
+            
+            logger.info(f"GPT request prepared successfully with model: {gpt_request['model']}, max_tokens: {gpt_request['max_tokens']}")
+            
+        except Exception as e:
+            logger.error(f"Error preparing GPT request: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Error preparing GPT request: {str(e)}"}), 400
         
         # Create job
         processing_jobs[job_id] = {
@@ -475,27 +509,98 @@ def submit_job():
 
 @app.route('/api/status', methods=['GET'])
 def get_job_status():
-    """Get the status of a job"""
+    """Get the status of a job or overall system status"""
     start_time = time.time()
     job_id = request.args.get('job_id')
     client_ip = request.remote_addr
     
-    logger.info(f"Status check from {client_ip} for job {job_id}")
-    
+    # If no job_id is provided, return system-wide status
     if not job_id:
-        logger.warning("Status check rejected: No job_id provided")
-        return jsonify({"error": "No job_id provided"}), 400
+        logger.info(f"System status check from {client_ip}")
+        
+        try:
+            # Count active jobs
+            active_jobs_count = len(processing_jobs)
+            active_jobs = [{
+                "job_id": jid,
+                "status": job["status"],
+                "submitted_at": job["submitted_at"],
+                "elapsed_time": time.time() - job["submitted_at"]
+            } for jid, job in processing_jobs.items()]
+            
+            # List and count completed jobs (files in the results directory)
+            completed_jobs = []
+            for file_path in RESULTS_DIR.glob('*.json'):
+                job_id = file_path.stem
+                try:
+                    with open(file_path, 'r') as f:
+                        job_data = json.load(f)
+                    
+                    # Only include completed jobs, not error jobs
+                    if job_data.get("status") == "completed":
+                        completed_jobs.append({
+                            "job_id": job_id,
+                            "completed_at": job_data.get("completed_at", 0),
+                            "file_name": file_path.name,
+                            "file_size_kb": round(file_path.stat().st_size / 1024, 2)
+                        })
+                except Exception as e:
+                    logger.error(f"Error reading job file {file_path}: {str(e)}")
+                    # Still include the file but with minimal info
+                    completed_jobs.append({
+                        "job_id": job_id,
+                        "file_name": file_path.name,
+                        "error": "Could not read file data"
+                    })
+            
+            # Sort completed jobs by completed_at (most recent first)
+            completed_jobs.sort(key=lambda x: x.get("completed_at", 0), reverse=True)
+            
+            # Get queue information
+            queue_size = request_queue.qsize()
+            
+            # Prepare response
+            response = {
+                "active_jobs_count": active_jobs_count,
+                "active_jobs": active_jobs,
+                "completed_jobs_count": len(completed_jobs),
+                "completed_jobs": completed_jobs,
+                "queue_size": queue_size,
+                "default_model": DEFAULT_MODEL,
+                "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+                "timestamp": time.time()
+            }
+            
+            processing_time = time.time() - start_time
+            logger.info(f"System status check completed in {processing_time:.2f}s")
+            
+            return jsonify(response)
+        
+        except Exception as e:
+            logger.error(f"Error generating system status: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Error generating system status: {str(e)}"}), 500
+    
+    # If job_id is provided, get specific job status
+    logger.info(f"Status check from {client_ip} for job {job_id}")
     
     # Check if job is in processing
     if job_id in processing_jobs:
-        status = processing_jobs[job_id]["status"]
+        job = processing_jobs[job_id]
+        status = job["status"]
+        elapsed_time = time.time() - job["submitted_at"]
+        
+        response = {
+            "job_id": job_id,
+            "status": status,
+            "submitted_at": job["submitted_at"],
+            "elapsed_time": elapsed_time,
+            "queue_position": get_queue_position(job_id)
+        }
+        
         logger.info(f"Status for job {job_id}: {status} (in memory)")
         processing_time = time.time() - start_time
         logger.info(f"Status check completed in {processing_time:.2f}s")
-        return jsonify({
-            "job_id": job_id,
-            "status": status
-        })
+        return jsonify(response)
     
     # Check if result file exists
     result_path = RESULTS_DIR / f"{job_id}.json"
@@ -503,14 +608,19 @@ def get_job_status():
         try:
             with open(result_path, 'r') as f:
                 result = json.load(f)
+            
             status = result.get("status", "unknown")
+            file_size_kb = round(result_path.stat().st_size / 1024, 2)
+            
+            # Add file metadata to the response
+            result["file_name"] = f"{job_id}.json"
+            result["file_size_kb"] = file_size_kb
+            
             logger.info(f"Status for job {job_id}: {status} (from file)")
             processing_time = time.time() - start_time
             logger.info(f"Status check completed in {processing_time:.2f}s")
-            return jsonify({
-                "job_id": job_id,
-                "status": status
-            })
+            
+            return jsonify(result)
         except Exception as e:
             logger.error(f"Error reading result file for job {job_id}: {str(e)}", exc_info=True)
             return jsonify({"error": f"Error reading result file: {str(e)}"}), 500
@@ -520,6 +630,30 @@ def get_job_status():
     logger.info(f"Status check completed in {processing_time:.2f}s")
     return jsonify({"error": f"Job {job_id} not found"}), 404
 
+# Helper function to find a job's position in the queue
+def get_queue_position(job_id):
+    """Determine the approximate position of a job in the queue"""
+    try:
+        # Get a list of items in the queue (this is a shallow copy)
+        queue_items = list(request_queue.queue)
+        
+        # Find position (if job_id is in the queue)
+        if job_id in queue_items:
+            return queue_items.index(job_id) + 1
+        
+        # If not found in queue but still in processing, it's likely being processed
+        if job_id in processing_jobs and processing_jobs[job_id]["status"] == "processing":
+            return 0  # 0 means currently processing
+            
+        # If not found but still in memory, might be in a weird state
+        if job_id in processing_jobs:
+            return -1  # -1 means unknown position
+            
+    except Exception as e:
+        logger.error(f"Error determining queue position for job {job_id}: {str(e)}")
+        return -1  # Error determining position
+    
+    return -1  # Not found
 @app.route('/api/retrieve', methods=['GET'])
 def retrieve_job():
     """Retrieve the result of a job"""
