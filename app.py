@@ -324,39 +324,40 @@ def worker():
                 except queue.Empty:
                     break  # No more jobs in queue
             
+            # Only process if we have jobs in the batch
             if batch:
                 logger.info(f"Worker found {len(batch)} jobs to process: {batch}")
-            
-            # Process the batch with ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                futures = {
-                    executor.submit(process_job, job_id): job_id for job_id in batch
-                }
                 
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as e:
-                        job_id = futures[future]
-                        logger.error(f"Error in thread for job {job_id}: {str(e)}", exc_info=True)
-                        # Handle error case
-                        if job_id in processing_jobs:
-                            # Create error JSON and save to file
-                            result = {
-                                "job_id": job_id,
-                                "status": "error",
-                                "submitted_at": processing_jobs[job_id]["submitted_at"],
-                                "completed_at": time.time(),
-                                "error": str(e)
-                            }
-                            
-                            # Save to file
-                            result_path = RESULTS_DIR / f"{job_id}.json"
-                            with open(result_path, 'w') as f:
-                                json.dump(result, f, indent=2)
-                            
-                            # Remove from processing queue
-                            del processing_jobs[job_id]
+                # Process the batch with ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=max(1, len(batch))) as executor:
+                    futures = {
+                        executor.submit(process_job, job_id): job_id for job_id in batch
+                    }
+                    
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as e:
+                            job_id = futures[future]
+                            logger.error(f"Error in thread for job {job_id}: {str(e)}", exc_info=True)
+                            # Handle error case
+                            if job_id in processing_jobs:
+                                # Create error JSON and save to file
+                                result = {
+                                    "job_id": job_id,
+                                    "status": "error",
+                                    "submitted_at": processing_jobs[job_id]["submitted_at"],
+                                    "completed_at": time.time(),
+                                    "error": str(e)
+                                }
+                                
+                                # Save to file
+                                result_path = RESULTS_DIR / f"{job_id}.json"
+                                with open(result_path, 'w') as f:
+                                    json.dump(result, f, indent=2)
+                                
+                                # Remove from processing queue
+                                del processing_jobs[job_id]
             
             # Log queue status every 30 seconds
             if time.time() % 30 < 1:
