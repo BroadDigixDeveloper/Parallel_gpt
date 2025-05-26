@@ -11,17 +11,23 @@ import logging
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
+import markdown
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import black, blue, darkblue
+import re
+from html import unescape
+from io import BytesIO
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging system (unchanged)
+# Configure logging system
 def setup_logging():
-    # Create logs directory if it doesn't exist
-    # # log_dir = Path("logs")
-    # log_dir.mkdir(exist_ok=True)
-    
-    # Configure root logger
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     
@@ -31,19 +37,8 @@ def setup_logging():
     console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
     
-    # File handler with rotation (10MB max size, keep 5 backup files)
-    # file_handler = RotatingFileHandler(
-    #     log_dir / "gpt_processor.log", 
-    #     maxBytes=10*1024*1024,  # 10MB
-    #     backupCount=5
-    # )
-    # file_handler.setLevel(logging.INFO)
-    # file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
-    # file_handler.setFormatter(file_formatter)
-    
     # Add handlers
     logger.addHandler(console_handler)
-    # logger.addHandler(file_handler)
     
     return logger
 
@@ -52,9 +47,9 @@ logger = setup_logging()
 
 app = Flask(__name__)
 
-# Updated Configuration
+# Configuration
 API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"  # Updated to responses endpoint
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4o"
 DEFAULT_MAX_TOKENS = 2000
 DEFAULT_TEMPERATURE = 0.2
@@ -64,38 +59,39 @@ DEFAULT_PRESENCE_PENALTY = 0.1
 MAX_CONCURRENT_REQUESTS = 10
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0
-MIN_COMPLETE_SIZE_KB = 2  # Minimum size in KB to consider a result complete
+MIN_COMPLETE_SIZE_KB = 2
 
 # File system paths
 RESULTS_DIR = Path("gpt_results")
+PDF_DIR = Path("gpt_pdfs")
 RESULTS_DIR.mkdir(exist_ok=True)
+PDF_DIR.mkdir(exist_ok=True)
 
 # In-memory processing queue
-processing_jobs = {}  # Jobs being processed
+processing_jobs = {}  # Child jobs being processed
+parent_jobs = {}  # Parent job tracking
 request_queue = queue.Queue()
 worker_running = False
 
-def prepare_gpt_request(json_data, request_params):
-    """Prepare the GPT request from the user-provided JSON data and request parameters"""
-    start_time = time.time()
-    logger.info(f"Preparing GPT request with user-provided prompts")
-    
+def prepare_child_gpt_request(system_prompt, user_prompt, request_params):
+    """Prepare the GPT request for a single child job with formatting instructions"""
     try:
-        # Extract system and user prompts directly from the JSON
-        system_content = json_data.get("system", "You are a helpful assistant.")
-        user_content = json_data.get("user", "")
+        # Enhanced system prompt for better formatting
+        enhanced_system_prompt = f"""{system_prompt}
+
+Please format your response with proper structure using:
+- **Bold text** for headings and important points
+- Use clear headings and subheadings
+- Organize content with proper paragraphs
+- Use bullet points or numbered lists where appropriate
+- Ensure the content is well-structured and professional
+"""
         
-        if not user_content:
-            logger.error("No user prompt provided in the JSON data")
-            return None
-        
-        # Create messages array
         messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content}
+            {"role": "system", "content": enhanced_system_prompt},
+            {"role": "user", "content": user_prompt}
         ]
         
-        # Create the full request payload with parameters from request or defaults
         request_data = {
             "model": request_params.get("model", DEFAULT_MODEL),
             "messages": messages,
@@ -107,16 +103,170 @@ def prepare_gpt_request(json_data, request_params):
             "response_format": {"type": "text"}
         }
         
-        # Log request details
-        logger.info(f"GPT request prepared successfully with model: {request_data['model']}, max_tokens: {request_data['max_tokens']}")
-        logger.info(f"Request preparation time: {time.time() - start_time:.2f}s")
-        
         return request_data
-    
     except Exception as e:
         logger.error(f"Error preparing GPT request: {str(e)}", exc_info=True)
         return None
 
+def create_pdf_from_content(content, job_id, user_prompt=""):
+    """Create a PDF from the GPT response content with improved formatting"""
+    try:
+        pdf_path = PDF_DIR / f"{job_id}.pdf"
+        
+        # Create the PDF document
+        doc = SimpleDocTemplate(
+            str(pdf_path),
+            pagesize=A4,
+            rightMargin=72,
+            leftMargin=72,
+            topMargin=72,
+            bottomMargin=72
+        )
+        
+        # Container for the 'Flowable' objects
+        elements = []
+        
+        # Define styles
+        styles = getSampleStyleSheet()
+        
+        # Custom styles - ALL TEXT IN BLACK
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=18,
+            spaceAfter=20,
+            spaceBefore=10,
+            alignment=TA_LEFT,
+            textColor=black,
+            leftIndent=0
+        )
+        
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            parent=styles['Heading2'],
+            fontSize=14,
+            spaceAfter=15,
+            spaceBefore=12,
+            textColor=black,
+            leftIndent=0
+        )
+        
+        normal_style = ParagraphStyle(
+            'CustomNormal',
+            parent=styles['Normal'],
+            fontSize=11,
+            spaceAfter=8,
+            spaceBefore=4,
+            alignment=TA_JUSTIFY,
+            leftIndent=0,
+            rightIndent=0,
+            textColor=black
+        )
+        
+        # Bullet point style (for clean indented text without bullets)
+        bullet_style = ParagraphStyle(
+            'CustomBullet',
+            parent=styles['Normal'],
+            fontSize=11,
+            spaceAfter=6,
+            spaceBefore=2,
+            alignment=TA_LEFT,
+            leftIndent=20,  # Indent for former bullet points
+            rightIndent=0,
+            textColor=black
+        )
+        
+        # Process the content to convert markdown-like formatting
+        formatted_content = format_content_for_pdf(content)
+        
+        # Split content into paragraphs and process each
+        paragraphs = formatted_content.split('\n\n')
+        
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            
+            # Skip empty lines or lines with just dashes
+            if para in ['---', '===', '───'] or re.match(r'^[-=─]+$', para):
+                continue
+                
+            # Check if it's a heading (starts with ###, ##, or #)
+            if para.startswith('#'):
+                # Handle markdown headings
+                if para.startswith('###'):
+                    heading_text = para.replace('###', '').strip()
+                    heading = Paragraph(f"<b>{heading_text}</b>", subtitle_style)
+                elif para.startswith('##'):
+                    heading_text = para.replace('##', '').strip()
+                    heading = Paragraph(f"<b>{heading_text}</b>", title_style)
+                elif para.startswith('#'):
+                    heading_text = para.replace('#', '').strip()
+                    heading = Paragraph(f"<b>{heading_text}</b>", title_style)
+                else:
+                    heading = Paragraph(para, normal_style)
+                elements.append(heading)
+                elements.append(Spacer(1, 8))
+            else:
+                # Check if this looks like it was originally a bullet point (indented content)
+                lines = para.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # If line looks like it was a bullet point (common patterns), use bullet style
+                    if (line.startswith(('Product', 'The', 'A', 'An', '•')) or 
+                        any(keyword in line.lower() for keyword in ['increase', 'decrease', 'growth', 'sales', 'market', 'customer'])):
+                        p = Paragraph(line, bullet_style)
+                    else:
+                        # Regular paragraph
+                        p = Paragraph(line, normal_style)
+                    
+                    elements.append(p)
+                    elements.append(Spacer(1, 4))
+        
+        # Build the PDF
+        doc.build(elements)
+        
+        logger.info(f"PDF created successfully for job {job_id}: {pdf_path}")
+        return True, str(pdf_path)
+        
+    except Exception as e:
+        logger.error(f"Error creating PDF for job {job_id}: {str(e)}", exc_info=True)
+        return False, str(e)
+
+
+def format_content_for_pdf(content):
+    """Format content for better PDF rendering - improved version"""
+    try:
+        # Remove horizontal lines (--- or similar patterns)
+        content = re.sub(r'^---+\s*$', '', content, flags=re.MULTILINE)
+        content = re.sub(r'^═+\s*$', '', content, flags=re.MULTILINE)
+        content = re.sub(r'^─+\s*$', '', content, flags=re.MULTILINE)
+        
+        # Convert markdown formatting to HTML with BLACK color
+        content = re.sub(r'\*\*(.*?)\*\*', r'<b><font color="black">\1</font></b>', content)  # Bold in black
+        content = re.sub(r'\*(.*?)\*', r'<i><font color="black">\1</font></i>', content)      # Italic in black
+        content = re.sub(r'`(.*?)`', r'<font name="Courier" color="black">\1</font>', content)  # Code in black
+        
+        # Handle bullet points - REMOVE bullets entirely, just keep the text
+        content = re.sub(r'^[-•*]\s+(.*?)$', r'\1', content, flags=re.MULTILINE)
+        
+        # Handle numbered lists - keep numbers but clean formatting
+        content = re.sub(r'^(\d+)\.\s+(.*?)$', r'\1. \2', content, flags=re.MULTILINE)
+        
+        # Clean up multiple consecutive newlines
+        content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
+        
+        # Clean up any HTML entities
+        content = unescape(content)
+        
+        return content.strip()
+        
+    except Exception as e:
+        logger.error(f"Error formatting content: {str(e)}", exc_info=True)
+        return content
 def call_openai_with_retry(request_data, job_id, max_retries=MAX_RETRIES, initial_backoff=INITIAL_BACKOFF):
     """Call OpenAI API with exponential backoff retry logic"""
     retry_count = 0
@@ -124,45 +274,37 @@ def call_openai_with_retry(request_data, job_id, max_retries=MAX_RETRIES, initia
     
     while retry_count <= max_retries:
         try:
-            # If not the first attempt, log retry
             if retry_count > 0:
                 logger.info(f"Retry attempt {retry_count}/{max_retries} for job {job_id} with backoff {backoff:.2f}s")
                 time.sleep(backoff)
                 
             response = requests.post(
-                OPENAI_API_URL,  # Using the updated responses endpoint
+                OPENAI_API_URL,
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {API_KEY}"
                 },
                 json=request_data,
-                timeout=60  # Add timeout to prevent hanging requests
+                timeout=60
             )
             
-            # Return successful responses and non-retriable errors immediately
             if response.status_code == 200 or (400 <= response.status_code < 500 and response.status_code != 429):
                 return response
                 
-            # For 5xx errors or rate limits (429), retry with backoff
             if response.status_code >= 500 or response.status_code == 429:
                 logger.warning(f"Job {job_id}: OpenAI API returned status {response.status_code}, retrying...")
             else:
-                # Other errors, don't retry
                 return response
             
         except requests.exceptions.RequestException as e:
             logger.warning(f"Job {job_id}: Request exception: {str(e)}, retrying...")
         
-        # Update retry count and backoff (exponential backoff with jitter)
         retry_count += 1
-        # Add jitter to prevent thundering herd
-        jitter = 0.8 + 0.4 * random.random()  # Random value between 0.8 and 1.2
+        jitter = 0.8 + 0.4 * random.random()
         backoff = backoff * 2 * jitter
     
-    # If we get here, we've exhausted all retries
     logger.error(f"Job {job_id}: Failed after {max_retries} retry attempts")
     
-    # Create a mock response object for the error case
     class MockResponse:
         def __init__(self):
             self.status_code = 500
@@ -174,134 +316,215 @@ def call_openai_with_retry(request_data, job_id, max_retries=MAX_RETRIES, initia
     return MockResponse()
 
 def process_job(job_id):
-    """Process a single job"""
+    """Process a single child job and create PDF"""
     start_time = time.time()
-    logger.info(f"Starting to process job {job_id}")
+    logger.info(f"Starting to process child job {job_id}")
     
     try:
         if job_id not in processing_jobs:
-            logger.warning(f"Job {job_id} not found in processing queue")
+            logger.warning(f"Child job {job_id} not found in processing queue")
             return
             
         job = processing_jobs[job_id]
         job["status"] = "processing"
-        logger.info(f"Processing job {job_id}")
+        logger.info(f"Processing child job {job_id}")
         
-        # Log request time
         api_start_time = time.time()
-        logger.info(f"Sending request to OpenAI API for job {job_id}")
+        logger.info(f"Sending request to OpenAI API for child job {job_id}")
         
-        # Call the OpenAI API with retry logic
         response = call_openai_with_retry(job["gpt_request"], job_id)
         
         api_time = time.time() - api_start_time
-        logger.info(f"OpenAI API response received for job {job_id}. Time taken: {api_time:.2f}s. Status code: {response.status_code}")
+        logger.info(f"OpenAI API response received for child job {job_id}. Time taken: {api_time:.2f}s. Status code: {response.status_code}")
         
-        # Check if the request was successful
         if response.status_code == 200:
             try:
                 response_json = response.json()
                 content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
                 token_usage = response_json.get("usage", {})
                 
-                logger.info(f"Job {job_id} completed successfully. Tokens used - Prompt: {token_usage.get('prompt_tokens', 'N/A')}, "
+                logger.info(f"Child job {job_id} completed successfully. Tokens used - Prompt: {token_usage.get('prompt_tokens', 'N/A')}, "
                             f"Completion: {token_usage.get('completion_tokens', 'N/A')}, "
                             f"Total: {token_usage.get('total_tokens', 'N/A')}")
                 
-                # Create result JSON
+                # Create PDF from the response
+                pdf_success, pdf_path_or_error = create_pdf_from_content(
+                    content, 
+                    job_id, 
+                    job.get("user_prompt", "")
+                )
+                
                 result = {
                     "job_id": job_id,
+                    "parent_job_id": job.get("parent_job_id"),
+                    "child_index": job.get("child_index"),
                     "status": "completed",
                     "submitted_at": job["submitted_at"],
                     "completed_at": time.time(),
                     "processing_time": time.time() - job["submitted_at"],
                     "api_time": api_time,
                     "token_usage": token_usage,
-                    "response": content  # Changed from "analysis" to "response"
+                    "user_prompt": job.get("user_prompt", ""),
+                    "response": content,
+                    "pdf_generated": pdf_success,
+                    "pdf_path": pdf_path_or_error if pdf_success else None,
+                    "pdf_error": pdf_path_or_error if not pdf_success else None
                 }
                 
-                # Save to file
+                # Save child job result
                 result_path = RESULTS_DIR / f"{job_id}.json"
                 with open(result_path, 'w') as f:
                     json.dump(result, f, indent=2)
                 
-                # Update job status
                 job["status"] = "completed"
+                
+                # Update parent job status
+                parent_job_id = job.get("parent_job_id")
+                if parent_job_id:
+                    update_parent_job_status(parent_job_id)
             
             except Exception as e:
-                logger.error(f"Error parsing OpenAI API response for job {job_id}: {str(e)}", exc_info=True)
+                logger.error(f"Error parsing OpenAI API response for child job {job_id}: {str(e)}", exc_info=True)
                 raise
                 
         else:
-            # Handle error - IMPROVED ERROR HANDLING
             error_message = "Unknown error"
             retriable_error = response.status_code >= 500 or response.status_code == 429
             
-            # Safely try to parse error message from response
             try:
                 error_data = response.json()
                 error_message = error_data.get("error", {}).get("message", "Unknown error")
             except Exception as e:
-                # If response is not valid JSON, use the response text or status code
                 if response.text:
                     error_message = f"API Error: {response.status_code} - {response.text[:200]}"
                 else:
                     error_message = f"API Error: {response.status_code}"
                 
-                logger.error(f"Could not parse error response from OpenAI API for job {job_id}: {str(e)}")
+                logger.error(f"Could not parse error response from OpenAI API for child job {job_id}: {str(e)}")
             
-            logger.error(f"OpenAI API error for job {job_id}: {error_message}")
+            logger.error(f"OpenAI API error for child job {job_id}: {error_message}")
             
-            # Create error JSON
             result = {
                 "job_id": job_id,
+                "parent_job_id": job.get("parent_job_id"),
+                "child_index": job.get("child_index"),
                 "status": "error",
                 "submitted_at": job["submitted_at"],
                 "completed_at": time.time(),
                 "processing_time": time.time() - job["submitted_at"],
                 "api_time": api_time,
                 "error": error_message,
-                "retriable": retriable_error
+                "retriable": retriable_error,
+                "user_prompt": job.get("user_prompt", ""),
+                "pdf_generated": False
             }
             
-            # Save to file
             result_path = RESULTS_DIR / f"{job_id}.json"
             with open(result_path, 'w') as f:
                 json.dump(result, f, indent=2)
             
-            # Update job status
             job["status"] = "error"
             
+            # Update parent job status
+            parent_job_id = job.get("parent_job_id")
+            if parent_job_id:
+                update_parent_job_status(parent_job_id)
+            
     except Exception as e:
-        # Handle unexpected errors
-        logger.error(f"Error processing job {job_id}: {str(e)}", exc_info=True)
+        logger.error(f"Error processing child job {job_id}: {str(e)}", exc_info=True)
         
-        # Create error JSON
         result = {
             "job_id": job_id,
+            "parent_job_id": job.get("parent_job_id") if job_id in processing_jobs else None,
+            "child_index": job.get("child_index") if job_id in processing_jobs else None,
             "status": "error",
-            "submitted_at": job["submitted_at"] if job_id in processing_jobs and "submitted_at" in processing_jobs[job_id] else time.time(),
+            "submitted_at": processing_jobs[job_id]["submitted_at"] if job_id in processing_jobs and "submitted_at" in processing_jobs[job_id] else time.time(),
             "completed_at": time.time(),
             "processing_time": time.time() - (processing_jobs[job_id]["submitted_at"] if job_id in processing_jobs and "submitted_at" in processing_jobs[job_id] else time.time()),
-            "error": str(e)
+            "error": str(e),
+            "pdf_generated": False
         }
         
-        # Save to file
         result_path = RESULTS_DIR / f"{job_id}.json"
         with open(result_path, 'w') as f:
             json.dump(result, f, indent=2)
         
-        # Update job status if it exists
         if job_id in processing_jobs:
             processing_jobs[job_id]["status"] = "error"
+            
+            parent_job_id = processing_jobs[job_id].get("parent_job_id")
+            if parent_job_id:
+                update_parent_job_status(parent_job_id)
     
     finally:
-        # Remove from processing queue when done
         if job_id in processing_jobs:
             del processing_jobs[job_id]
         
         total_time = time.time() - start_time
-        logger.info(f"Finished processing job {job_id}. Total processing time: {total_time:.2f}s")
+        logger.info(f"Finished processing child job {job_id}. Total processing time: {total_time:.2f}s")
+
+def update_parent_job_status(parent_job_id):
+    """Update parent job status based on child job statuses"""
+    try:
+        if parent_job_id not in parent_jobs:
+            return
+            
+        parent_job = parent_jobs[parent_job_id]
+        child_job_ids = parent_job["child_job_ids"]
+        
+        # Check status of all child jobs
+        completed_children = 0
+        error_children = 0
+        processing_children = 0
+        
+        for child_id in child_job_ids:
+            if child_id in processing_jobs:
+                processing_children += 1
+            else:
+                # Check file
+                result_path = RESULTS_DIR / f"{child_id}.json"
+                if result_path.exists():
+                    try:
+                        with open(result_path, 'r') as f:
+                            child_result = json.load(f)
+                        if child_result.get("status") == "completed":
+                            completed_children += 1
+                        elif child_result.get("status") == "error":
+                            error_children += 1
+                    except:
+                        error_children += 1
+                else:
+                    processing_children += 1
+        
+        # Update parent status
+        total_children = len(child_job_ids)
+        if completed_children == total_children:
+            parent_job["status"] = "completed"
+        elif error_children + completed_children == total_children:
+            parent_job["status"] = "partially_completed"
+        else:
+            parent_job["status"] = "processing"
+            
+        # Save parent job status
+        parent_result = {
+            "job_id": parent_job_id,
+            "type": "parent",
+            "status": parent_job["status"],
+            "submitted_at": parent_job["submitted_at"],
+            "total_children": total_children,
+            "completed_children": completed_children,
+            "error_children": error_children,
+            "processing_children": processing_children,
+            "child_job_ids": child_job_ids,
+            "updated_at": time.time()
+        }
+        
+        parent_result_path = RESULTS_DIR / f"{parent_job_id}_parent.json"
+        with open(parent_result_path, 'w') as f:
+            json.dump(parent_result, f, indent=2)
+            
+    except Exception as e:
+        logger.error(f"Error updating parent job {parent_job_id}: {str(e)}", exc_info=True)
 
 def worker():
     """Background worker to process queued requests"""
@@ -310,25 +533,26 @@ def worker():
     
     logger.info("Background worker thread started with thread ID: %s", threading.get_ident())
     
+    # Add proper interval tracking for conditional logging
+    last_status_log = time.time()
+    status_log_interval = 30  # Check every 30 seconds
+    
     while worker_running:
         try:
-            # Get up to MAX_CONCURRENT_REQUESTS jobs from the queue
             batch = []
             for _ in range(MAX_CONCURRENT_REQUESTS):
                 try:
-                    job_id = request_queue.get(block=True, timeout=1)  # Use blocking with timeout
+                    job_id = request_queue.get(block=True, timeout=1)
                     if job_id in processing_jobs:
                         batch.append(job_id)
-                        logger.info(f"Added job {job_id} to current processing batch")
+                        logger.info(f"Added child job {job_id} to current processing batch")
                     request_queue.task_done()
                 except queue.Empty:
-                    break  # No more jobs in queue
+                    break
             
-            # Only process if we have jobs in the batch
             if batch:
-                logger.info(f"Worker found {len(batch)} jobs to process: {batch}")
+                logger.info(f"Worker found {len(batch)} child jobs to process: {batch}")
                 
-                # Process the batch with ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=max(1, len(batch))) as executor:
                     futures = {
                         executor.submit(process_job, job_id): job_id for job_id in batch
@@ -339,31 +563,35 @@ def worker():
                             future.result()
                         except Exception as e:
                             job_id = futures[future]
-                            logger.error(f"Error in thread for job {job_id}: {str(e)}", exc_info=True)
-                            # Handle error case
+                            logger.error(f"Error in thread for child job {job_id}: {str(e)}", exc_info=True)
                             if job_id in processing_jobs:
-                                # Create error JSON and save to file
                                 result = {
                                     "job_id": job_id,
                                     "status": "error",
                                     "submitted_at": processing_jobs[job_id]["submitted_at"],
                                     "completed_at": time.time(),
-                                    "error": str(e)
+                                    "error": str(e),
+                                    "pdf_generated": False
                                 }
                                 
-                                # Save to file
                                 result_path = RESULTS_DIR / f"{job_id}.json"
                                 with open(result_path, 'w') as f:
                                     json.dump(result, f, indent=2)
                                 
-                                # Remove from processing queue
                                 del processing_jobs[job_id]
             
-            # Log queue status every 30 seconds
-            if time.time() % 30 < 1:
-                logger.info(f"Queue status: Size={request_queue.qsize()}, Active jobs={len(processing_jobs)}")
+            # Conditional status logging - only log when there's activity
+            current_time = time.time()
+            if current_time - last_status_log >= status_log_interval:
+                queue_size = request_queue.qsize()
+                active_jobs = len(processing_jobs)
                 
-            # Sleep a tiny bit if no jobs
+                # Only log when there are active jobs or items in queue
+                if queue_size > 0 or active_jobs > 0:
+                    logger.info(f"Queue status: Size={queue_size}, Active child jobs={active_jobs}")
+                
+                last_status_log = current_time
+                
             if not batch:
                 time.sleep(0.1)
                 
@@ -373,21 +601,18 @@ def worker():
 
 @app.route('/api/submit', methods=['POST'])
 def submit_job():
-    """Submit a new job with prompts from a JSON file or JSON data"""
+    """Submit a new job with multiple prompts in user_prompts array"""
     start_time = time.time()
     
     try:
-        # Get job_id from request
         job_id = request.args.get('job_id')
         
-        # Generate a job_id if not provided
         if not job_id:
             job_id = f"job_{int(time.time() * 1000)}"
         
         client_ip = request.remote_addr
-        logger.info(f"New job submission from {client_ip}. Job ID: {job_id}")
+        logger.info(f"New parent job submission from {client_ip}. Job ID: {job_id}")
         
-        # Extract API parameters from request
         request_params = {
             "model": request.args.get('model', DEFAULT_MODEL),
             "max_tokens": request.args.get('max_tokens', DEFAULT_MAX_TOKENS),
@@ -397,182 +622,153 @@ def submit_job():
             "presence_penalty": request.args.get('presence_penalty', DEFAULT_PRESENCE_PENALTY)
         }
         
-        logger.info(f"Request parameters for job {job_id}: model={request_params['model']}, max_tokens={request_params['max_tokens']}, "
-                   f"temperature={request_params['temperature']}, top_p={request_params['top_p']}")
+        # Check if parent job already exists
+        if (job_id in parent_jobs or 
+            (RESULTS_DIR / f"{job_id}_parent.json").exists() or
+            any(child_id.startswith(f"{job_id}_child_") for child_id in processing_jobs)):
+            logger.warning(f"Parent job ID '{job_id}' already exists. Request rejected.")
+            return jsonify({"error": f"Parent job ID '{job_id}' already exists"}), 400
         
-        # Check if job already exists
-        if job_id in processing_jobs or (RESULTS_DIR / f"{job_id}.json").exists():
-            logger.warning(f"Job ID '{job_id}' already exists. Request rejected.")
-            return jsonify({"error": f"Job ID '{job_id}' already exists"}), 400
-        
-        # Determine request type and get prompt data
+        # Get JSON data
         json_data = {}
         
-        # Check if a JSON file was uploaded
         if 'json_file' in request.files:
             json_file = request.files['json_file']
-            
             try:
                 json_content = json_file.read().decode('utf-8')
                 json_data = json.loads(json_content)
-                
-                logger.info(f"Job {job_id} data received from JSON file")
+                logger.info(f"Parent job {job_id} data received from JSON file")
             except json.JSONDecodeError as e:
-                logger.error(f"Error parsing JSON file for job {job_id}: {str(e)}", exc_info=True)
+                logger.error(f"Error parsing JSON file for parent job {job_id}: {str(e)}", exc_info=True)
                 return jsonify({"error": f"Error parsing JSON file: {str(e)}"}), 400
-            except Exception as e:
-                logger.error(f"Error reading JSON file for job {job_id}: {str(e)}", exc_info=True)
-                return jsonify({"error": f"Error reading JSON file: {str(e)}"}), 400
-        
-        # If no JSON file, try JSON in request body
         elif request.is_json:
             json_data = request.json
-            logger.info(f"Job {job_id} data received with prompts from JSON body")
+            logger.info(f"Parent job {job_id} data received from JSON body")
         else:
-            logger.warning(f"Job {job_id} rejected: Request must contain either a JSON file or JSON data in request body")
-            return jsonify({"error": "Request must contain either a JSON file or JSON data in request body"}), 400
+            return jsonify({"error": "Request must contain either a JSON file or JSON data"}), 400
         
-        # Validate that we have required fields
-        if "messages" not in json_data and "user" not in json_data:
-            logger.warning(f"Job {job_id} rejected: JSON must contain either 'messages' array or 'user' field")
-            return jsonify({"error": "JSON must contain either 'messages' array or 'user' field"}), 400
+        # Validate JSON structure
+        if "user_prompts" not in json_data:
+            return jsonify({
+                "error": "JSON must contain 'user_prompts' array. Format: {\"system\": \"...\", \"user_prompts\": [\"prompt1\", \"prompt2\", ...]}"
+            }), 400
         
-        # If no messages array but has user field, create messages array
-        if "messages" not in json_data and "user" in json_data:
-            system_content = json_data.get("system", "You are a helpful assistant.")
-            user_content = json_data["user"]
-            
-            # Create messages array in expected format
-            json_data["messages"] = [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content}
-            ]
-            
-            logger.info(f"Created messages array from system/user fields for job {job_id}")
+        system_prompt = json_data.get("system", "You are a helpful assistant.")
+        user_prompts = json_data["user_prompts"]
         
-        # Prepare GPT request
-        logger.info(f"Preparing GPT request for job {job_id}")
+        if not isinstance(user_prompts, list) or len(user_prompts) == 0:
+            return jsonify({"error": "user_prompts must be a non-empty array"}), 400
         
-        # Modified prepare_gpt_request logic included inline
-        try:
-            # Use the messages array directly if it exists
-            if "messages" in json_data:
-                messages = json_data["messages"]
-            else:
-                # This should never happen due to validation above, but just in case
-                logger.error(f"No messages array or user prompt for job {job_id}")
-                return jsonify({"error": "Invalid JSON structure: no messages or user prompt"}), 400
-            
-            # Create the full request payload with parameters from request or defaults
-            gpt_request = {
-                "model": request_params.get("model", DEFAULT_MODEL),
-                "messages": messages,
-                "temperature": float(request_params.get("temperature", DEFAULT_TEMPERATURE)),
-                "max_tokens": int(request_params.get("max_tokens", DEFAULT_MAX_TOKENS)),
-                "top_p": float(request_params.get("top_p", DEFAULT_TOP_P)),
-                "frequency_penalty": float(request_params.get("frequency_penalty", DEFAULT_FREQUENCY_PENALTY)),
-                "presence_penalty": float(request_params.get("presence_penalty", DEFAULT_PRESENCE_PENALTY)),
-                "response_format": {"type": "text"}
-            }
-            
-            logger.info(f"GPT request prepared successfully with model: {gpt_request['model']}, max_tokens: {gpt_request['max_tokens']}")
-            
-        except Exception as e:
-            logger.error(f"Error preparing GPT request: {str(e)}", exc_info=True)
-            return jsonify({"error": f"Error preparing GPT request: {str(e)}"}), 400
+        logger.info(f"Parent job {job_id}: Found {len(user_prompts)} user prompts")
         
-        # Create job
-        processing_jobs[job_id] = {
-            "status": "queued",
+        # Create parent job tracking
+        parent_jobs[job_id] = {
+            "status": "processing",
             "submitted_at": time.time(),
-            "json_data": json_data,
-            "gpt_request": gpt_request
+            "child_job_ids": [],
+            "total_prompts": len(user_prompts)
         }
         
-        # Add to queue
-        request_queue.put(job_id)
-        logger.info(f"Job {job_id} added to processing queue. Queue size: {request_queue.qsize()}")
+        # Create child jobs
+        child_job_ids = []
+        for i, user_prompt in enumerate(user_prompts, 1):
+            child_job_id = f"{job_id}_child_{i}"
+            child_job_ids.append(child_job_id)
+            
+            # Prepare GPT request for this child
+            gpt_request = prepare_child_gpt_request(system_prompt, user_prompt, request_params)
+            if not gpt_request:
+                return jsonify({"error": f"Error preparing GPT request for prompt {i}"}), 400
+            
+            # Create child job
+            processing_jobs[child_job_id] = {
+                "status": "queued",
+                "submitted_at": time.time(),
+                "parent_job_id": job_id,
+                "child_index": i,
+                "user_prompt": user_prompt,
+                "gpt_request": gpt_request
+            }
+            
+            # Add to queue for parallel processing
+            request_queue.put(child_job_id)
+            logger.info(f"Child job {child_job_id} added to processing queue")
+        
+        # Update parent job with child IDs
+        parent_jobs[job_id]["child_job_ids"] = child_job_ids
+        
+        # Save initial parent job status
+        update_parent_job_status(job_id)
         
         processing_time = time.time() - start_time
-        logger.info(f"Job {job_id} submission processing completed in {processing_time:.2f}s")
+        logger.info(f"Parent job {job_id} submission completed with {len(child_job_ids)} child jobs in {processing_time:.2f}s")
         
         return jsonify({
             "job_id": job_id,
-            "status": "queued",
-            "message": "Job submitted successfully"
+            "type": "parent",
+            "status": "processing",
+            "child_job_ids": child_job_ids,
+            "total_prompts": len(user_prompts),
+            "message": f"Parent job submitted successfully with {len(child_job_ids)} child jobs processing in parallel. PDFs will be generated for each response."
         })
         
     except Exception as e:
-        logger.error(f"Error submitting job: {str(e)}", exc_info=True)
-        return jsonify({"error": f"Error submitting job: {str(e)}"}), 500
+        logger.error(f"Error submitting parent job: {str(e)}", exc_info=True)
+        return jsonify({"error": f"Error submitting parent job: {str(e)}"}), 500
 
+@app.route('/api/pdf/<job_id>', methods=['GET'])
+def download_pdf(job_id):
+    """Download PDF for a specific job"""
+    try:
+        client_ip = request.remote_addr
+        logger.info(f"PDF download request from {client_ip} for job {job_id}")
+        
+        pdf_path = PDF_DIR / f"{job_id}.pdf"
+        
+        if not pdf_path.exists():
+            logger.warning(f"PDF not found for job {job_id}: {pdf_path}")
+            return jsonify({
+                "error": f"PDF not found for job {job_id}",
+                "message": "The PDF may not have been generated yet, or the job may have failed"
+            }), 404
+        
+        logger.info(f"Serving PDF for job {job_id}: {pdf_path}")
+        
+        return send_file(
+            str(pdf_path),
+            as_attachment=True,
+            download_name=f"gpt_response_{job_id}.pdf",
+            mimetype='application/pdf'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error serving PDF for job {job_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": f"Error serving PDF: {str(e)}"}), 500
 
 @app.route('/api/status', methods=['GET'])
 def get_job_status():
-    """Get the status of a job or overall system status"""
+    """Get the status of a job (parent or child) - now includes PDF status"""
     start_time = time.time()
     job_id = request.args.get('job_id')
     client_ip = request.remote_addr
     
-    # If no job_id is provided, return system-wide status
     if not job_id:
+        # Return system status
         logger.info(f"System status check from {client_ip}")
         
         try:
-            # Count active jobs
-            active_jobs_count = len(processing_jobs)
-            active_jobs = [{
-                "job_id": jid,
-                "status": job["status"],
-                "submitted_at": job["submitted_at"],
-                "elapsed_time": time.time() - job["submitted_at"]
-            } for jid, job in processing_jobs.items()]
+            active_child_jobs = len(processing_jobs)
+            active_parent_jobs = len(parent_jobs)
             
-            # List and count completed jobs (files in the results directory)
-            completed_jobs = []
-            for file_path in RESULTS_DIR.glob('*.json'):
-                job_id = file_path.stem
-                try:
-                    with open(file_path, 'r') as f:
-                        job_data = json.load(f)
-                    
-                    # Only include completed jobs, not error jobs
-                    if job_data.get("status") == "completed":
-                        completed_jobs.append({
-                            "job_id": job_id,
-                            "completed_at": job_data.get("completed_at", 0),
-                            "file_name": file_path.name,
-                            "file_size_kb": round(file_path.stat().st_size / 1024, 2)
-                        })
-                except Exception as e:
-                    logger.error(f"Error reading job file {file_path}: {str(e)}")
-                    # Still include the file but with minimal info
-                    completed_jobs.append({
-                        "job_id": job_id,
-                        "file_name": file_path.name,
-                        "error": "Could not read file data"
-                    })
-            
-            # Sort completed jobs by completed_at (most recent first)
-            completed_jobs.sort(key=lambda x: x.get("completed_at", 0), reverse=True)
-            
-            # Get queue information
-            queue_size = request_queue.qsize()
-            
-            # Prepare response
             response = {
-                "active_jobs_count": active_jobs_count,
-                "active_jobs": active_jobs,
-                "completed_jobs_count": len(completed_jobs),
-                "completed_jobs": completed_jobs,
-                "queue_size": queue_size,
+                "active_child_jobs_count": active_child_jobs,
+                "active_parent_jobs_count": active_parent_jobs,
+                "queue_size": request_queue.qsize(),
                 "default_model": DEFAULT_MODEL,
                 "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+                "pdf_generation_enabled": True,
                 "timestamp": time.time()
             }
-            
-            processing_time = time.time() - start_time
-            logger.info(f"System status check completed in {processing_time:.2f}s")
             
             return jsonify(response)
         
@@ -580,45 +776,71 @@ def get_job_status():
             logger.error(f"Error generating system status: {str(e)}", exc_info=True)
             return jsonify({"error": f"Error generating system status: {str(e)}"}), 500
     
-    # If job_id is provided, get specific job status
     logger.info(f"Status check from {client_ip} for job {job_id}")
     
-    # Check if job is in processing
+    # Check if it's a parent job
+    parent_path = RESULTS_DIR / f"{job_id}_parent.json"
+    if job_id in parent_jobs or parent_path.exists():
+        try:
+            if job_id in parent_jobs:
+                parent_job = parent_jobs[job_id]
+                response = {
+                    "job_id": job_id,
+                    "type": "parent",
+                    "status": parent_job["status"],
+                    "submitted_at": parent_job["submitted_at"],
+                    "child_job_ids": parent_job["child_job_ids"],
+                    "total_prompts": parent_job["total_prompts"]
+                }
+            else:
+                with open(parent_path, 'r') as f:
+                    response = json.load(f)
+            
+            # Add PDF availability info for completed children
+            if "child_job_ids" in response:
+                pdf_status = {}
+                for child_id in response["child_job_ids"]:
+                    pdf_path = PDF_DIR / f"{child_id}.pdf"
+                    pdf_status[child_id] = pdf_path.exists()
+                response["pdf_availability"] = pdf_status
+            
+            return jsonify(response)
+        except Exception as e:
+            logger.error(f"Error reading parent job status for {job_id}: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Error reading parent job status: {str(e)}"}), 500
+    
+    # Check if it's a child job in processing
     if job_id in processing_jobs:
         job = processing_jobs[job_id]
-        status = job["status"]
-        elapsed_time = time.time() - job["submitted_at"]
-        
         response = {
             "job_id": job_id,
-            "status": status,
+            "type": "child",
+            "status": job["status"],
             "submitted_at": job["submitted_at"],
-            "elapsed_time": elapsed_time,
-            "queue_position": get_queue_position(job_id)
+            "elapsed_time": time.time() - job["submitted_at"],
+            "parent_job_id": job.get("parent_job_id"),
+            "child_index": job.get("child_index"),
+            "pdf_available": False
         }
         
-        logger.info(f"Status for job {job_id}: {status} (in memory)")
-        processing_time = time.time() - start_time
-        logger.info(f"Status check completed in {processing_time:.2f}s")
         return jsonify(response)
     
-    # Check if result file exists
+    # Check if child job result file exists
     result_path = RESULTS_DIR / f"{job_id}.json"
     if result_path.exists():
         try:
             with open(result_path, 'r') as f:
                 result = json.load(f)
             
-            status = result.get("status", "unknown")
-            file_size_kb = round(result_path.stat().st_size / 1024, 2)
+            result["type"] = "child"
+            result["file_size_kb"] = round(result_path.stat().st_size / 1024, 2)
             
-            # Add file metadata to the response
-            result["file_name"] = f"{job_id}.json"
-            result["file_size_kb"] = file_size_kb
-            
-            logger.info(f"Status for job {job_id}: {status} (from file)")
-            processing_time = time.time() - start_time
-            logger.info(f"Status check completed in {processing_time:.2f}s")
+            # Check PDF availability
+            pdf_path = PDF_DIR / f"{job_id}.pdf"
+            result["pdf_available"] = pdf_path.exists()
+            if result["pdf_available"]:
+                result["pdf_size_kb"] = round(pdf_path.stat().st_size / 1024, 2)
+                result["download_url"] = f"/api/pdf/{job_id}"
             
             return jsonify(result)
         except Exception as e:
@@ -626,37 +848,11 @@ def get_job_status():
             return jsonify({"error": f"Error reading result file: {str(e)}"}), 500
     
     logger.warning(f"Job {job_id} not found")
-    processing_time = time.time() - start_time
-    logger.info(f"Status check completed in {processing_time:.2f}s")
     return jsonify({"error": f"Job {job_id} not found"}), 404
 
-# Helper function to find a job's position in the queue
-def get_queue_position(job_id):
-    """Determine the approximate position of a job in the queue"""
-    try:
-        # Get a list of items in the queue (this is a shallow copy)
-        queue_items = list(request_queue.queue)
-        
-        # Find position (if job_id is in the queue)
-        if job_id in queue_items:
-            return queue_items.index(job_id) + 1
-        
-        # If not found in queue but still in processing, it's likely being processed
-        if job_id in processing_jobs and processing_jobs[job_id]["status"] == "processing":
-            return 0  # 0 means currently processing
-            
-        # If not found but still in memory, might be in a weird state
-        if job_id in processing_jobs:
-            return -1  # -1 means unknown position
-            
-    except Exception as e:
-        logger.error(f"Error determining queue position for job {job_id}: {str(e)}")
-        return -1  # Error determining position
-    
-    return -1  # Not found
 @app.route('/api/retrieve', methods=['GET'])
 def retrieve_job():
-    """Retrieve the result of a job"""
+    """Retrieve the result of a job (parent returns all children, child returns individual) - now includes PDF info"""
     start_time = time.time()
     job_id = request.args.get('job_id')
     client_ip = request.remote_addr
@@ -664,74 +860,144 @@ def retrieve_job():
     logger.info(f"Result retrieval request from {client_ip} for job {job_id}")
     
     if not job_id:
-        logger.warning("Retrieval rejected: No job_id provided")
         return jsonify({"error": "No job_id provided"}), 400
     
-    # Check if result file exists
+    # Check if it's a parent job
+    parent_path = RESULTS_DIR / f"{job_id}_parent.json"
+    if parent_path.exists() or job_id in parent_jobs:
+        try:
+            # Get parent job info
+            if job_id in parent_jobs:
+                parent_job = parent_jobs[job_id]
+                child_job_ids = parent_job["child_job_ids"]
+            else:
+                with open(parent_path, 'r') as f:
+                    parent_data = json.load(f)
+                child_job_ids = parent_data["child_job_ids"]
+            
+            # Collect all child results
+            child_results = []
+            completed_count = 0
+            error_count = 0
+            pdf_count = 0
+            
+            for child_id in child_job_ids:
+                child_path = RESULTS_DIR / f"{child_id}.json"
+                if child_path.exists():
+                    try:
+                        with open(child_path, 'r') as f:
+                            child_result = json.load(f)
+                        
+                        # Add PDF info
+                        pdf_path = PDF_DIR / f"{child_id}.pdf"
+                        child_result["pdf_available"] = pdf_path.exists()
+                        if child_result["pdf_available"]:
+                            child_result["pdf_size_kb"] = round(pdf_path.stat().st_size / 1024, 2)
+                            child_result["download_url"] = f"/api/pdf/{child_id}"
+                            pdf_count += 1
+                        
+                        child_results.append(child_result)
+                        if child_result.get("status") == "completed":
+                            completed_count += 1
+                        elif child_result.get("status") == "error":
+                            error_count += 1
+                    except Exception as e:
+                        logger.error(f"Error reading child result {child_id}: {str(e)}")
+                        child_results.append({
+                            "job_id": child_id,
+                            "status": "error",
+                            "error": f"Could not read result file: {str(e)}",
+                            "pdf_available": False
+                        })
+                        error_count += 1
+                else:
+                    # Child still processing
+                    child_results.append({
+                        "job_id": child_id,
+                        "status": "processing",
+                        "message": "Child job is still processing",
+                        "pdf_available": False
+                    })
+            
+            # Sort child results by child_index
+            child_results.sort(key=lambda x: x.get("child_index", 0))
+            
+            # Create parent response with all child results
+            parent_response = {
+                "job_id": job_id,
+                "type": "parent",
+                "status": "completed" if completed_count == len(child_job_ids) else "processing",
+                "total_children": len(child_job_ids),
+                "completed_children": completed_count,
+                "error_children": error_count,
+                "pdfs_generated": pdf_count,
+                "child_results": child_results,
+                "retrieved_at": time.time()
+            }
+            
+            logger.info(f"Parent job {job_id} retrieval completed: {completed_count}/{len(child_job_ids)} children completed, {pdf_count} PDFs generated")
+            return jsonify(parent_response)
+            
+        except Exception as e:
+            logger.error(f"Error retrieving parent job {job_id}: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Error retrieving parent job: {str(e)}"}), 500
+    
+    # Check if it's a child job
     result_path = RESULTS_DIR / f"{job_id}.json"
     if result_path.exists():
         try:
-            # Get file size
             file_size = result_path.stat().st_size
             file_size_kb = file_size / 1024
-            logger.info(f"Retrieving result file for job {job_id}. File size: {file_size_kb:.2f}KB")
             
-            # Read the result file
             with open(result_path, 'r') as f:
                 result = json.load(f)
             
-            # Check if we should return this as a completed result
             if file_size_kb < MIN_COMPLETE_SIZE_KB and result.get("status") != "completed":
-                logger.info(f"Job {job_id} result file is smaller than {MIN_COMPLETE_SIZE_KB}KB, treating as still processing")
-                processing_time = time.time() - start_time
-                
-                # Return minimal response for jobs that are not complete
-                minimal_response = {
+                return jsonify({
                     "job_id": job_id,
+                    "type": "child",
                     "status": "processing",
-                    "submitted_at": result.get("submitted_at", time.time()),
-                    "message": f"Job is still processing (result size: {file_size_kb:.2f}KB)"
-                }
-                
-                logger.info(f"Retrieval request completed in {processing_time:.2f}s")
-                return jsonify(minimal_response)
+                    "message": f"Child job is still processing (result size: {file_size_kb:.2f}KB)",
+                    "pdf_available": False
+                })
             
-            # Return the complete result
-            processing_time = time.time() - start_time
-            logger.info(f"Result retrieval completed in {processing_time:.2f}s")
+            result["type"] = "child"
+            result["file_size_kb"] = file_size_kb
+            result["retrieved_at"] = time.time()
+            
+            # Add PDF info
+            pdf_path = PDF_DIR / f"{job_id}.pdf"
+            result["pdf_available"] = pdf_path.exists()
+            if result["pdf_available"]:
+                result["pdf_size_kb"] = round(pdf_path.stat().st_size / 1024, 2)
+                result["download_url"] = f"/api/pdf/{job_id}"
+            
             return jsonify(result)
             
         except Exception as e:
-            logger.error(f"Error reading result file for job {job_id}: {str(e)}", exc_info=True)
+            logger.error(f"Error reading result file for child job {job_id}: {str(e)}", exc_info=True)
             return jsonify({"error": f"Error reading result file: {str(e)}"}), 500
     
-    # Check if job is still processing
+    # Check if child job is still processing
     if job_id in processing_jobs:
-        status = processing_jobs[job_id]["status"]
-        
-        # Create a minimal response for jobs that are still processing
-        minimal_response = {
+        job = processing_jobs[job_id]
+        return jsonify({
             "job_id": job_id,
-            "status": status,
-            "submitted_at": processing_jobs[job_id].get("submitted_at", time.time()),
-            "message": "Job is still processing"
-        }
-        
-        logger.info(f"Retrieval for job {job_id} - Still processing with status: {status}")
-        processing_time = time.time() - start_time
-        logger.info(f"Retrieval request completed in {processing_time:.2f}s")
-        
-        # Return the minimal response
-        return jsonify(minimal_response)
+            "type": "child",
+            "status": job["status"],
+            "submitted_at": job.get("submitted_at", time.time()),
+            "parent_job_id": job.get("parent_job_id"),
+            "child_index": job.get("child_index"),
+            "message": "Child job is still processing",
+            "pdf_available": False
+        })
     
     logger.warning(f"Job {job_id} not found for retrieval")
-    processing_time = time.time() - start_time
-    logger.info(f"Retrieval request completed in {processing_time:.2f}s")
     return jsonify({"error": f"Job {job_id} not found"}), 404
 
 @app.route('/api/delete', methods=['GET'])
 def delete_job():
-    """Delete a job result"""
+    """Delete a job result (parent deletes all children, child deletes individual) - now includes PDF cleanup"""
     start_time = time.time()
     job_id = request.args.get('job_id')
     client_ip = request.remote_addr
@@ -739,89 +1005,209 @@ def delete_job():
     logger.info(f"Delete request from {client_ip} for job {job_id}")
     
     if not job_id:
-        logger.warning("Delete rejected: No job_id provided")
         return jsonify({"error": "No job_id provided"}), 400
     
-    # Check if result file exists
+    # Check if it's a parent job
+    parent_path = RESULTS_DIR / f"{job_id}_parent.json"
+    if parent_path.exists() or job_id in parent_jobs:
+        try:
+            # Get child job IDs
+            child_job_ids = []
+            if job_id in parent_jobs:
+                child_job_ids = parent_jobs[job_id]["child_job_ids"]
+                del parent_jobs[job_id]
+            else:
+                with open(parent_path, 'r') as f:
+                    parent_data = json.load(f)
+                child_job_ids = parent_data["child_job_ids"]
+            
+            # Delete all child jobs
+            deleted_children = []
+            deleted_pdfs = []
+            failed_deletions = []
+            
+            for child_id in child_job_ids:
+                try:
+                    # Remove from processing queue if still there
+                    if child_id in processing_jobs:
+                        del processing_jobs[child_id]
+                    
+                    # Delete result file
+                    child_path = RESULTS_DIR / f"{child_id}.json"
+                    if child_path.exists():
+                        child_path.unlink()
+                    
+                    # Delete PDF file
+                    pdf_path = PDF_DIR / f"{child_id}.pdf"
+                    if pdf_path.exists():
+                        pdf_path.unlink()
+                        deleted_pdfs.append(child_id)
+                    
+                    deleted_children.append(child_id)
+                        
+                except Exception as e:
+                    logger.error(f"Error deleting child job {child_id}: {str(e)}")
+                    failed_deletions.append({"job_id": child_id, "error": str(e)})
+            
+            # Delete parent job file
+            if parent_path.exists():
+                parent_path.unlink()
+            
+            logger.info(f"Parent job {job_id} and {len(deleted_children)} child jobs deleted successfully, {len(deleted_pdfs)} PDFs deleted")
+            
+            response = {
+                "job_id": job_id,
+                "type": "parent",
+                "status": "deleted",
+                "deleted_children": deleted_children,
+                "deleted_pdfs": deleted_pdfs,
+                "failed_deletions": failed_deletions,
+                "message": f"Parent job and {len(deleted_children)} child jobs deleted successfully, {len(deleted_pdfs)} PDFs cleaned up"
+            }
+            
+            if failed_deletions:
+                response["message"] += f" ({len(failed_deletions)} child deletions failed)"
+            
+            return jsonify(response)
+            
+        except Exception as e:
+            logger.error(f"Error deleting parent job {job_id}: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Error deleting parent job: {str(e)}"}), 500
+    
+    # Check if it's a child job
     result_path = RESULTS_DIR / f"{job_id}.json"
     if result_path.exists():
         try:
+            # Get parent job ID before deletion
+            parent_job_id = None
+            try:
+                with open(result_path, 'r') as f:
+                    child_data = json.load(f)
+                parent_job_id = child_data.get("parent_job_id")
+            except:
+                pass
+            
+            # Delete child job file
             result_path.unlink()
-            logger.info(f"Job {job_id} result file deleted successfully")
-            processing_time = time.time() - start_time
-            logger.info(f"Delete request completed in {processing_time:.2f}s")
+            
+            # Delete PDF file
+            pdf_deleted = False
+            pdf_path = PDF_DIR / f"{job_id}.pdf"
+            if pdf_path.exists():
+                pdf_path.unlink()
+                pdf_deleted = True
+            
+            logger.info(f"Child job {job_id} result file deleted successfully, PDF deleted: {pdf_deleted}")
+            
+            # Update parent job status if exists
+            if parent_job_id:
+                update_parent_job_status(parent_job_id)
+            
             return jsonify({
                 "job_id": job_id,
+                "type": "child",
                 "status": "deleted",
-                "message": "Job deleted successfully"
+                "parent_job_id": parent_job_id,
+                "pdf_deleted": pdf_deleted,
+                "message": f"Child job deleted successfully{'with PDF' if pdf_deleted else ''}"
             })
+            
         except Exception as e:
-            logger.error(f"Error deleting result file for job {job_id}: {str(e)}", exc_info=True)
-            return jsonify({"error": f"Error deleting job: {str(e)}"}), 500
+            logger.error(f"Error deleting child job result file for {job_id}: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Error deleting child job: {str(e)}"}), 500
     
-    # Check if job is still processing
+    # Check if child job is still processing
     if job_id in processing_jobs:
+        parent_job_id = processing_jobs[job_id].get("parent_job_id")
         del processing_jobs[job_id]
-        logger.info(f"Job {job_id} cancelled while in processing queue")
-        processing_time = time.time() - start_time
-        logger.info(f"Delete request completed in {processing_time:.2f}s")
+        
+        # Update parent job status if exists
+        if parent_job_id:
+            update_parent_job_status(parent_job_id)
+        
+        logger.info(f"Child job {job_id} cancelled while in processing queue")
         return jsonify({
             "job_id": job_id,
+            "type": "child",
             "status": "cancelled",
-            "message": "Job cancelled successfully"
+            "parent_job_id": parent_job_id,
+            "message": "Child job cancelled successfully"
         })
     
     logger.warning(f"Job {job_id} not found for deletion")
-    processing_time = time.time() - start_time
-    logger.info(f"Delete request completed in {processing_time:.2f}s")
     return jsonify({"error": f"Job {job_id} not found"}), 404
+
+# Helper function to find a job's position in the queue
+def get_queue_position(job_id):
+    """Determine the approximate position of a job in the queue"""
+    try:
+        queue_items = list(request_queue.queue)
+        
+        if job_id in queue_items:
+            return queue_items.index(job_id) + 1
+        
+        if job_id in processing_jobs and processing_jobs[job_id]["status"] == "processing":
+            return 0
+            
+        if job_id in processing_jobs:
+            return -1
+            
+    except Exception as e:
+        logger.error(f"Error determining queue position for job {job_id}: {str(e)}")
+        return -1
+    
+    return -1
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     logger.info("Health check request received")
     
-    # Get system status
     queue_size = request_queue.qsize()
-    active_jobs = len(processing_jobs)
+    active_child_jobs = len(processing_jobs)
+    active_parent_jobs = len(parent_jobs)
+    
+    # Count PDF files
+    pdf_count = len(list(PDF_DIR.glob("*.pdf")))
     
     response = {
         "status": "healthy",
         "queue_size": queue_size,
-        "active_jobs": active_jobs,
+        "active_child_jobs": active_child_jobs,
+        "active_parent_jobs": active_parent_jobs,
         "worker_running": worker_running,
         "model": DEFAULT_MODEL,
         "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
         "max_retries": MAX_RETRIES,
-        "min_complete_size_kb": MIN_COMPLETE_SIZE_KB
+        "min_complete_size_kb": MIN_COMPLETE_SIZE_KB,
+        "pdf_generation_enabled": True,
+        "total_pdfs_generated": pdf_count
     }
     
-    logger.info(f"Health check response: Queue size: {queue_size}, Active jobs: {active_jobs}")
+    logger.info(f"Health check response: Queue size: {queue_size}, Active child jobs: {active_child_jobs}, Active parent jobs: {active_parent_jobs}, PDFs: {pdf_count}")
     return jsonify(response)
 
 if __name__ == '__main__':
-    # Setup logging
-    logger.info("Starting GPT Prompting Service")
+    logger.info("Starting GPT Prompting Service with Parent-Child Job Support and PDF Generation")
     logger.info(f"Default model: {DEFAULT_MODEL}")
     logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
     logger.info(f"Max retries: {MAX_RETRIES}")
     logger.info(f"Results directory: {RESULTS_DIR}")
+    logger.info(f"PDF directory: {PDF_DIR}")
     
-    # Ensure results directory exists
     RESULTS_DIR.mkdir(exist_ok=True)
+    PDF_DIR.mkdir(exist_ok=True)
     
-    # Start the worker thread
     logger.info("Starting background worker thread")
     worker_thread = threading.Thread(target=worker, daemon=True, name="WorkerThread")
     worker_thread.start()
     
-    # Run the app
     port = int(os.environ.get('PORT', 8081))
     logger.info(f"Starting Flask web server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
 else:
-    # For when imported as a module (like with Gunicorn)
     RESULTS_DIR.mkdir(exist_ok=True)
+    PDF_DIR.mkdir(exist_ok=True)
     logger.info("Starting background worker thread (WSGI mode)")
     worker_thread = threading.Thread(target=worker, daemon=True, name="WorkerThread")
     worker_thread.start()
