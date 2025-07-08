@@ -315,7 +315,7 @@ def call_openai_with_retry(request_data, job_id, max_retries=MAX_RETRIES, initia
     return MockResponse()
 
 def process_job(job_id):
-    """Process a single child job and create PDF"""
+    """Process a single child job and conditionally create PDF"""
     start_time = time.time()
     logger.info(f"Starting to process child job {job_id}")
     
@@ -326,7 +326,9 @@ def process_job(job_id):
             
         job = processing_jobs[job_id]
         job["status"] = "processing"
-        logger.info(f"Processing child job {job_id}")
+        pdf_enabled = job.get("pdf_enabled", True)  # Default to True for backward compatibility
+        
+        logger.info(f"Processing child job {job_id}, PDF generation: {pdf_enabled}")
         
         api_start_time = time.time()
         logger.info(f"Sending request to OpenAI API for child job {job_id}")
@@ -346,12 +348,22 @@ def process_job(job_id):
                             f"Completion: {token_usage.get('completion_tokens', 'N/A')}, "
                             f"Total: {token_usage.get('total_tokens', 'N/A')}")
                 
-                # Create PDF from the response
-                pdf_success, pdf_path_or_error = create_pdf_from_content(
-                    content, 
-                    job_id, 
-                    job.get("user_prompt", "")
-                )
+                # CONDITIONALLY CREATE PDF
+                pdf_success = False
+                pdf_path_or_error = None
+                
+                if pdf_enabled:
+                    pdf_success, pdf_path_or_error = create_pdf_from_content(
+                        content, 
+                        job_id, 
+                        job.get("user_prompt", "")
+                    )
+                    if pdf_success:
+                        logger.info(f"PDF created successfully for job {job_id}")
+                    else:
+                        logger.error(f"PDF creation failed for job {job_id}: {pdf_path_or_error}")
+                else:
+                    logger.info(f"PDF generation disabled for job {job_id}")
                 
                 result = {
                     "job_id": job_id,
@@ -365,9 +377,10 @@ def process_job(job_id):
                     "token_usage": token_usage,
                     "user_prompt": job.get("user_prompt", ""),
                     "response": content,
+                    "pdf_enabled": pdf_enabled,  # ADD THIS LINE
                     "pdf_generated": pdf_success,
                     "pdf_path": pdf_path_or_error if pdf_success else None,
-                    "pdf_error": pdf_path_or_error if not pdf_success else None
+                    "pdf_error": pdf_path_or_error if pdf_enabled and not pdf_success else None
                 }
                 
                 # Save child job result
@@ -415,6 +428,7 @@ def process_job(job_id):
                 "error": error_message,
                 "retriable": retriable_error,
                 "user_prompt": job.get("user_prompt", ""),
+                "pdf_enabled": job.get("pdf_enabled", True),  # ADD THIS LINE
                 "pdf_generated": False
             }
             
@@ -441,6 +455,7 @@ def process_job(job_id):
             "completed_at": time.time(),
             "processing_time": time.time() - (processing_jobs[job_id]["submitted_at"] if job_id in processing_jobs and "submitted_at" in processing_jobs[job_id] else time.time()),
             "error": str(e),
+            "pdf_enabled": processing_jobs[job_id].get("pdf_enabled", True) if job_id in processing_jobs else True,  # ADD THIS LINE
             "pdf_generated": False
         }
         
@@ -504,7 +519,7 @@ def update_parent_job_status(parent_job_id):
         else:
             parent_job["status"] = "processing"
             
-        # Save parent job status
+        # Save parent job status - ADD PDF_ENABLED INFO
         parent_result = {
             "job_id": parent_job_id,
             "type": "parent",
@@ -515,6 +530,7 @@ def update_parent_job_status(parent_job_id):
             "error_children": error_children,
             "processing_children": processing_children,
             "child_job_ids": child_job_ids,
+            "pdf_generation_enabled": parent_job.get("pdf_enabled", True),  # ADD THIS LINE
             "updated_at": time.time()
         }
         
@@ -606,11 +622,14 @@ def submit_job():
     try:
         job_id = request.args.get('job_id')
         
+        # Add PDF generation control parameter
+        generate_pdf = request.args.get('generate_pdf', 'true').lower() in ['true', '1', 'yes', 'on']
+        
         if not job_id:
             job_id = f"job_{int(time.time() * 1000)}"
         
         client_ip = request.remote_addr
-        logger.info(f"New parent job submission from {client_ip}. Job ID: {job_id}")
+        logger.info(f"New parent job submission from {client_ip}. Job ID: {job_id}, PDF Generation: {generate_pdf}")
         
         request_params = {
             "model": request.args.get('model', DEFAULT_MODEL),
@@ -660,12 +679,13 @@ def submit_job():
         
         logger.info(f"Parent job {job_id}: Found {len(user_prompts)} user prompts")
         
-        # Create parent job tracking
+        # Create parent job tracking - ADD PDF_ENABLED FLAG
         parent_jobs[job_id] = {
             "status": "processing",
             "submitted_at": time.time(),
             "child_job_ids": [],
-            "total_prompts": len(user_prompts)
+            "total_prompts": len(user_prompts),
+            "pdf_enabled": generate_pdf  # ADD THIS LINE
         }
         
         # Create child jobs
@@ -679,14 +699,15 @@ def submit_job():
             if not gpt_request:
                 return jsonify({"error": f"Error preparing GPT request for prompt {i}"}), 400
             
-            # Create child job
+            # Create child job - ADD PDF_ENABLED FLAG
             processing_jobs[child_job_id] = {
                 "status": "queued",
                 "submitted_at": time.time(),
                 "parent_job_id": job_id,
                 "child_index": i,
                 "user_prompt": user_prompt,
-                "gpt_request": gpt_request
+                "gpt_request": gpt_request,
+                "pdf_enabled": generate_pdf  # ADD THIS LINE
             }
             
             # Add to queue for parallel processing
@@ -708,19 +729,39 @@ def submit_job():
             "status": "processing",
             "child_job_ids": child_job_ids,
             "total_prompts": len(user_prompts),
-            "message": f"Parent job submitted successfully with {len(child_job_ids)} child jobs processing in parallel. PDFs will be generated for each response."
+            "pdf_generation_enabled": generate_pdf,  # ADD THIS LINE
+            "message": f"Parent job submitted successfully with {len(child_job_ids)} child jobs processing in parallel" + 
+                      (". PDFs will be generated for each response." if generate_pdf else ". PDF generation disabled.")
         })
         
     except Exception as e:
         logger.error(f"Error submitting parent job: {str(e)}", exc_info=True)
         return jsonify({"error": f"Error submitting parent job: {str(e)}"}), 500
-
 @app.route('/api/pdf/<job_id>', methods=['GET'])
 def download_pdf(job_id):
-    """Download PDF for a specific job"""
+    """Download PDF for a specific job - now checks if PDF generation was enabled"""
     try:
         client_ip = request.remote_addr
         logger.info(f"PDF download request from {client_ip} for job {job_id}")
+        
+        # First check if the job result exists and if PDF was enabled
+        result_path = RESULTS_DIR / f"{job_id}.json"
+        if result_path.exists():
+            try:
+                with open(result_path, 'r') as f:
+                    job_result = json.load(f)
+                
+                # Check if PDF generation was disabled for this job
+                if not job_result.get("pdf_enabled", True):
+                    logger.warning(f"PDF generation was disabled for job {job_id}")
+                    return jsonify({
+                        "error": f"PDF generation was disabled for job {job_id}",
+                        "message": "This job was submitted with PDF generation disabled (generate_pdf=false)",
+                        "pdf_enabled": False
+                    }), 404
+                    
+            except Exception as e:
+                logger.warning(f"Could not read job result for {job_id}: {str(e)}")
         
         pdf_path = PDF_DIR / f"{job_id}.pdf"
         
@@ -728,7 +769,7 @@ def download_pdf(job_id):
             logger.warning(f"PDF not found for job {job_id}: {pdf_path}")
             return jsonify({
                 "error": f"PDF not found for job {job_id}",
-                "message": "The PDF may not have been generated yet, or the job may have failed"
+                "message": "The PDF may not have been generated yet, the job may have failed, or PDF generation was disabled"
             }), 404
         
         logger.info(f"Serving PDF for job {job_id}: {pdf_path}")
@@ -765,7 +806,7 @@ def get_job_status():
                 "queue_size": request_queue.qsize(),
                 "default_model": DEFAULT_MODEL,
                 "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
-                "pdf_generation_enabled": True,
+                "pdf_generation_default": True,  # UPDATED TO SHOW DEFAULT
                 "timestamp": time.time()
             }
             
@@ -789,7 +830,8 @@ def get_job_status():
                     "status": parent_job["status"],
                     "submitted_at": parent_job["submitted_at"],
                     "child_job_ids": parent_job["child_job_ids"],
-                    "total_prompts": parent_job["total_prompts"]
+                    "total_prompts": parent_job["total_prompts"],
+                    "pdf_generation_enabled": parent_job.get("pdf_enabled", True)  # ADD THIS LINE
                 }
             else:
                 with open(parent_path, 'r') as f:
@@ -819,6 +861,7 @@ def get_job_status():
             "elapsed_time": time.time() - job["submitted_at"],
             "parent_job_id": job.get("parent_job_id"),
             "child_index": job.get("child_index"),
+            "pdf_enabled": job.get("pdf_enabled", True),  # ADD THIS LINE
             "pdf_available": False
         }
         
@@ -834,7 +877,7 @@ def get_job_status():
             result["type"] = "child"
             result["file_size_kb"] = round(result_path.stat().st_size / 1024, 2)
             
-            # Check PDF availability
+            # Check PDF availability (and if it was enabled)
             pdf_path = PDF_DIR / f"{job_id}.pdf"
             result["pdf_available"] = pdf_path.exists()
             if result["pdf_available"]:
