@@ -284,7 +284,7 @@ def call_openai_with_retry(request_data, job_id, max_retries=MAX_RETRIES, initia
                     "Authorization": f"Bearer {API_KEY}"
                 },
                 json=request_data,
-                timeout=60
+                timeout=240
             )
             
             if response.status_code == 200 or (400 <= response.status_code < 500 and response.status_code != 429):
